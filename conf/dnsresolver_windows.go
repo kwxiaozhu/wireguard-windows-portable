@@ -6,18 +6,31 @@
 package conf
 
 import (
+	"encoding/json"
 	"fmt"
-	"github.com/miekg/dns"
-	//"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wireguard/windows/services"
 	"net"
+	"net/http"
 	"time"
 )
 
-const dnsPort = "53"
-const dnsServer = "223.5.5.5"
+const dohURL = "https://cloudflare-dns.com/dns-query"
+
+type dnsAnswer struct {
+	Data string `json:"data"`
+	Type int    `json:"type"`
+}
+
+type dnsResponse struct {
+	Answer []dnsAnswer `json:"Answer"`
+}
 
 func resolveHostname(name string, port uint16) (resolvedEndpoint *Endpoint, err error) {
+	ip := net.ParseIP(name)
+	if ip != nil {
+		return &Endpoint{Host: ip.String(), Port: port}, nil
+	}
+
 	maxTries := 10
 	if services.StartedAtBoot() {
 		maxTries *= 3
@@ -30,48 +43,69 @@ func resolveHostname(name string, port uint16) (resolvedEndpoint *Endpoint, err 
 		if err == nil {
 			return
 		}
-		return
 	}
 	return
 }
 
 func resolveHostnameOnce(name string, port uint16) (resolvedEndpoint *Endpoint, err error) {
-	c := new(dns.Client)
-	m := new(dns.Msg)
-	m.SetQuestion(dns.Fqdn(name), dns.TypeA)
-	m.RecursionDesired = true
-
-	r, _, err := c.Exchange(m, net.JoinHostPort(dnsServer, dnsPort))
-	if err != nil {
-		return nil, fmt.Errorf("DNS query failed: %w", err)
-	}
-	if r != nil {
-		for _, ans := range r.Answer {
-			if a, ok := ans.(*dns.A); ok {
-				return &Endpoint{Host: a.A.String(), Port: port}, nil
-			}
-		}
+	// Query A records
+	aRecords, errA := dohResolveAll(name, "A")
+	if errA == nil && len(aRecords) > 0 {
+		return &Endpoint{Host: aRecords[0], Port: port}, nil
 	}
 
-	m.SetQuestion(dns.Fqdn(name), dns.TypeAAAA)
-	r, _, err = c.Exchange(m, net.JoinHostPort(dnsServer, dnsPort))
-	if err != nil {
-		return nil, fmt.Errorf("DNS query failed: %w", err)
-	}
-	if r != nil {
-		for _, ans := range r.Answer {
-			if v6Addr, ok := ans.(*dns.AAAA); ok {
-				// Check whether this is a Teredo address
-				if v6Addr.AAAA[0] == 0x20 && v6Addr.AAAA[1] == 0x01 && v6Addr.AAAA[2] == 0x00 && v6Addr.AAAA[3] == 0x00 {
-					v4Addr := net.IPv4(v6Addr.AAAA[12], v6Addr.AAAA[13], v6Addr.AAAA[14], v6Addr.AAAA[15])
-					port := (uint16(v6Addr.AAAA[10]) << 8) | uint16(v6Addr.AAAA[11])
-					return &Endpoint{Host: v4Addr.String(), Port: port}, nil
-				}
-				return &Endpoint{Host: v6Addr.AAAA.String(), Port: port}, nil
+	// Query AAAA records
+	aaaaRecords, errAAAA := dohResolveAll(name, "AAAA")
+	if errAAAA == nil && len(aaaaRecords) > 0 {
+		for _, addr := range aaaaRecords {
+			ip := net.ParseIP(addr)
+			// Check for IP4P (Teredo-like) format: 2001:0000::/32 or similar custom mapping
+			if ip != nil && len(ip) == net.IPv6len &&
+				ip[0] == 0x20 && ip[1] == 0x01 && ip[2] == 0x00 && ip[3] == 0x00 {
+
+				// Extract port (bytes 10,11)
+				ipPort := (uint16(ip[10]) << 8) | uint16(ip[11])
+				// Extract IPv4 (bytes 12~15)
+				v4Addr := net.IPv4(ip[12], ip[13], ip[14], ip[15])
+				return &Endpoint{Host: v4Addr.String(), Port: ipPort}, nil
 			}
 		}
+		// If no IP4P, just return the first AAAA as IPv6
+		return &Endpoint{Host: aaaaRecords[0], Port: port}, nil
 	}
+
 	return nil, fmt.Errorf("no A or AAAA records found for %s", name)
+}
+
+func dohResolveAll(name string, qtype string) ([]string, error) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	req, err := http.NewRequest("GET", dohURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	q := req.URL.Query()
+	q.Add("name", name)
+	q.Add("type", qtype)
+	req.URL.RawQuery = q.Encode()
+	req.Header.Set("accept", "application/dns-json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var dr dnsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&dr); err != nil {
+		return nil, err
+	}
+	var results []string
+	for _, ans := range dr.Answer {
+		// A=1, AAAA=28
+		if (qtype == "A" && ans.Type == 1) || (qtype == "AAAA" && ans.Type == 28) {
+			results = append(results, ans.Data)
+		}
+	}
+	return results, nil
 }
 
 func (config *Config) ResolveEndpoints() error {
